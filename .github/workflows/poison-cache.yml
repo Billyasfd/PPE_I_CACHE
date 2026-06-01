@@ -1,0 +1,21 @@
+name: 1. Attacker - Poison Cache
+
+on: workflow_dispatch   # Manual trigger
+
+jobs:
+  poison-job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Poisoned Tool
+        run: |
+          chmod +x scripts/poison-cache.sh
+          ./scripts/poison-cache.sh
+
+      - name: Upload Malicious Cache
+        uses: actions/cache/save@v4
+        with:
+          path: processor
+          key: ${{ runner.os }}-build-tool-v1
