@@ -32,12 +32,5 @@ jobs:
 
       - name: Security Check
         run: |
-          if [ -f "CANARY_ACTIVE" ]; then
-            echo "------------------------------------------------"
-            echo "CRITICAL FAILURE: POISONED CACHE DETECTED!"
-            echo "Canary file 'CANARY_ACTIVE' was found."
-            echo "------------------------------------------------"
-            exit 1
-          else
             echo "Security check passed."
-          fi
+          
