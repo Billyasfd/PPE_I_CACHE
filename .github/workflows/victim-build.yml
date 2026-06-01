@@ -1,0 +1,43 @@
+name: 2. Victim - Main Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore Tool from Cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: processor
+          key: ${{ runner.os }}-build-tool-v1
+
+      - name: Run Tool
+        run: |
+          if [ -f "./processor" ]; then
+            echo "Found tool in cache! Executing..."
+            ./processor
+          else
+            echo "Cache miss. Using legitimate fallback..."
+            echo "echo 'Legitimate processing...'" > processor
+            chmod +x processor
+            ./processor
+          fi
+
+      - name: Security Check
+        run: |
+          if [ -f "CANARY_ACTIVE" ]; then
+            echo "------------------------------------------------"
+            echo "CRITICAL FAILURE: POISONED CACHE DETECTED!"
+            echo "Canary file 'CANARY_ACTIVE' was found."
+            echo "------------------------------------------------"
+            exit 1
+          else
+            echo "Security check passed."
+          fi
