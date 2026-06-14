@@ -1,0 +1,299 @@
+name: Security — Trivy + PPE Detection
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+
+# ==================== JOB 1: TRIVY CVE/CWE SCAN ====================
+
+  trivy-scan:
+    name: Trivy CVE / CWE Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create .trivyignore if missing
+        run: "[ -f .trivyignore ] || touch .trivyignore"
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: json
+          output: trivy-report.json
+          trivyignores: .trivyignore
+
+      - name: Print Trivy summary table
+        if: always()
+        run: |
+          echo "========================================="
+          echo "  Trivy Findings Summary"
+          echo "========================================="
+          trivy convert --format table --severity HIGH,CRITICAL trivy-report.json || true
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-${{ github.sha }}
+          path: trivy-report.json
+          retention-days: 30
+
+# ==================== JOB 2: PPE DETECTION ====================
+
+  ppe-detection:
+    name: Poison Pipeline Execution Detection
+    runs-on: ubuntu-latest
+    needs: trivy-scan
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run PPE scanner
+        shell: bash
+        run: |
+          echo "========================================="
+          echo "  Poison Pipeline Execution Detection"
+          echo "  Scope: workflow files + all .sh files"
+          echo "========================================="
+
+          FAILED=0
+          WARNINGS=0
+
+          # ------------------------------------------------------------------
+          # Helper — scan a single file against all rule categories.
+          # Usage: scan_file <filepath> <label>
+          # Sets FAILED=1 on critical hits, increments WARNINGS on suspicious.
+          # ------------------------------------------------------------------
+          scan_file() {
+            local FILE="$1"
+            local LABEL="$2"
+
+            echo ""
+            echo "  ── Scanning: $LABEL ──"
+
+            # ---------------------------------------------------------------
+            # RULE 1 — Exfiltration endpoints (known data-sink domains/tools)
+            # ---------------------------------------------------------------
+            if grep -qEi \
+              'webhook\.site|requestbin|hookbin|burpcollaborator|interactsh|canarytokens|pipedream\.net|ngrok\.io|serveo\.net|localhost\.run' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [EXFIL-ENDPOINT] Known exfiltration endpoint detected"
+              grep -nEi \
+                'webhook\.site|requestbin|hookbin|burpcollaborator|interactsh|canarytokens|pipedream\.net|ngrok\.io|serveo\.net|localhost\.run' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # curl/wget POST with variable data
+            if grep -qE \
+              'curl.*(--data|-d|-F|--form|--upload-file|-T).*\$|wget.*(--post-data|--post-file).*\$' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [EXFIL-HTTP] HTTP data exfiltration via curl/wget POST"
+              grep -nE \
+                'curl.*(--data|-d|-F|--form|--upload-file|-T).*\$|wget.*(--post-data|--post-file).*\$' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 2 — DNS exfiltration
+            # ---------------------------------------------------------------
+            if grep -qE \
+              'nslookup\s+\$|dig\s+.*\$.*\.|host\s+\$|curl.*dns|nslookup.*\$\{|dig\s+\+short.*\$' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [EXFIL-DNS] DNS-based exfiltration pattern detected"
+              grep -nE \
+                'nslookup\s+\$|dig\s+.*\$.*\.|host\s+\$|curl.*dns|nslookup.*\$\{|dig\s+\+short.*\$' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 3 — Reverse shells
+            # ---------------------------------------------------------------
+            if grep -qE \
+              'bash\s+-i\s*>&?\s*/dev/tcp|/dev/tcp/[0-9a-zA-Z$\{]|nc\s+-[elu]*\s*[0-9a-zA-Z$].*-e\s*(bash|sh)|socat\s+.*EXEC|python.*socket.*connect|perl.*socket.*connect|ruby.*TCPSocket' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [REVSHELL] Reverse shell pattern detected"
+              grep -nE \
+                'bash\s+-i\s*>&?\s*/dev/tcp|/dev/tcp/[0-9a-zA-Z$\{]|nc\s+-[elu]*\s*[0-9a-zA-Z$].*-e\s*(bash|sh)|socat\s+.*EXEC|python.*socket.*connect|perl.*socket.*connect|ruby.*TCPSocket' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 4 — Credential harvesting
+            # ---------------------------------------------------------------
+            if grep -qE \
+              'printenv|/proc/self/environ|/proc/[0-9]+/environ|cat\s+/etc/passwd|cat\s+/etc/shadow|~\/\.aws\/|~\/\.ssh\/|\.aws/credentials|\.ssh/id_rsa' \
+              "$FILE" 2>/dev/null; then
+              echo "    ⚠️  [CRED-HARVEST] Potential credential/environment harvesting"
+              grep -nE \
+                'printenv|/proc/self/environ|/proc/[0-9]+/environ|cat\s+/etc/passwd|cat\s+/etc/shadow|~\/\.aws\/|~\/\.ssh\/|\.aws/credentials|\.ssh/id_rsa' \
+                "$FILE"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            # Explicit CI secret variable dumps
+            if grep -qE \
+              'echo.*\$(AWS_|SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY|GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN)' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [CRED-DUMP] CI secret variable being echoed/exfiltrated"
+              grep -nE \
+                'echo.*\$(AWS_|SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY|GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN)' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 5 — Dynamic / remote code execution
+            # ---------------------------------------------------------------
+            if grep -qE \
+              'curl\s+.*\|\s*(bash|sh|python|ruby|perl|node)|wget\s+.*\|\s*(bash|sh|python|ruby|perl|node)|fetch.*\|\s*(bash|sh)' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [RCE-PIPE] Remote code execution via pipe to shell"
+              grep -nE \
+                'curl\s+.*\|\s*(bash|sh|python|ruby|perl|node)|wget\s+.*\|\s*(bash|sh|python|ruby|perl|node)|fetch.*\|\s*(bash|sh)' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            if grep -qE \
+              '\beval\s+[\$\`\("]|\beval\s+\$\(|exec\s+\$\(|exec\s+<\(' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [RCE-EVAL] Dynamic eval/exec of variable or subshell content"
+              grep -nE \
+                '\beval\s+[\$\`\("]|\beval\s+\$\(|exec\s+\$\(|exec\s+<\(' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 6 — Runtime installation of offensive/network tools
+            # ---------------------------------------------------------------
+            if grep -qE \
+              '(apk add|apt-get install|apt install|yum install|pip install|npm install -g)\s+.*(nmap|netcat|ncat|socat|masscan|hydra|sqlmap|metasploit|beef|proxychains|tcpdump|wireshark|tshark|aircrack|hashcat|john)' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [TOOL-INSTALL] Offensive/network tool being installed at runtime"
+              grep -nE \
+                '(apk add|apt-get install|apt install|yum install|pip install|npm install -g)\s+.*(nmap|netcat|ncat|socat|masscan|hydra|sqlmap|metasploit|beef|proxychains|tcpdump|wireshark|tshark|aircrack|hashcat|john)' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            if grep -qE \
+              '(apk add|apt-get install|apt install|yum install)\s+.*(curl|wget)\b' \
+              "$FILE" 2>/dev/null; then
+              echo "    ⚠️  [TOOL-INSTALL] curl/wget being installed dynamically"
+              grep -nE \
+                '(apk add|apt-get install|apt install|yum install)\s+.*(curl|wget)\b' \
+                "$FILE"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            # ---------------------------------------------------------------
+            # RULE 7 — Encoded / obfuscated payloads
+            # ---------------------------------------------------------------
+            if grep -qE \
+              'base64\s+-d\s*\||(echo|printf)\s+[A-Za-z0-9+/]{20,}={0,2}\s*\|\s*(base64\s+-d|base64\s+--decode)|base64\s+--decode\s*\|' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [OBFUS-B64] Base64-encoded payload being decoded and executed"
+              grep -nE \
+                'base64\s+-d\s*\||(echo|printf)\s+[A-Za-z0-9+/]{20,}={0,2}\s*\|\s*(base64\s+-d|base64\s+--decode)|base64\s+--decode\s*\|' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            if grep -qE \
+              'xxd\s+-r|-fromhex|python.*decode.*hex|perl.*pack.*H\*|printf.*\\\\x[0-9a-fA-F]{2}' \
+              "$FILE" 2>/dev/null; then
+              echo "    ❌ [OBFUS-HEX] Hex-encoded payload decoding detected"
+              grep -nE \
+                'xxd\s+-r|-fromhex|python.*decode.*hex|perl.*pack.*H\*|printf.*\\\\x[0-9a-fA-F]{2}' \
+                "$FILE"
+              FAILED=1
+            fi
+
+            OBFUS_LINES=$(grep -cE 'echo.*=+.*=+' "$FILE" 2>/dev/null || echo 0)
+            if [ "$OBFUS_LINES" -ge 3 ]; then
+              echo "    ⚠️  [OBFUS-NOISE] High echo-barrier count ($OBFUS_LINES) — possible obfuscation noise"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            if grep -qE \
+              'base64\s+<<<\s*\$|echo\s+\$.*\|\s*base64\b' \
+              "$FILE" 2>/dev/null; then
+              echo "    ⚠️  [OBFUS-ENC] Variable being base64-encoded — possible exfiltration staging"
+              grep -nE \
+                'base64\s+<<<\s*\$|echo\s+\$.*\|\s*base64\b' \
+                "$FILE"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+          }
+
+          # ------------------------------------------------------------------
+          # SCAN TARGETS
+          # ------------------------------------------------------------------
+
+          # 1. All GitHub Actions workflow files
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  [A] GitHub Actions Workflow Files"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          WORKFLOW_FILES=$(find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) 2>/dev/null)
+
+          if [ -z "$WORKFLOW_FILES" ]; then
+            echo "  No workflow files found under .github/workflows/"
+          else
+            for WF in $WORKFLOW_FILES; do
+              scan_file "$WF" "$WF"
+            done
+          fi
+
+          # 2. All shell scripts in repo
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  [B] Repository Shell Scripts"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          SH_FILES=$(find . -name "*.sh" -type f ! -path "./.git/*" 2>/dev/null)
+
+          if [ -z "$SH_FILES" ]; then
+            echo "  No shell scripts found in repository"
+          else
+            for SHFILE in $SH_FILES; do
+              scan_file "$SHFILE" "$SHFILE"
+            done
+          fi
+
+          # ------------------------------------------------------------------
+          # FINAL VERDICT
+          # ------------------------------------------------------------------
+          echo ""
+          echo "========================================="
+          echo "  Scan complete"
+          echo "  Critical findings : $([ $FAILED -eq 1 ] && echo '≥1 ❌' || echo '0 ✅')"
+          echo "  Warnings          : $WARNINGS"
+          echo "========================================="
+
+          if [ $FAILED -eq 1 ]; then
+            echo "  ❌ PPE DETECTED — Pipeline blocked"
+            echo "========================================="
+            exit 1
+          else
+            echo "  ✅ No pipeline poison detected"
+            echo "========================================="
+          fi
